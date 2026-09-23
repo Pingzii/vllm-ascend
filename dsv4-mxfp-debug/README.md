@@ -25,7 +25,8 @@
 * 代码一律走文件（可自检：`git apply --check` + 脚本锚点校验），**对话只用来传结论**。
 
 > 说明：本会话的 shell 被沙箱拒绝（`pwsh` 调用直接失败），且这个工作区不是 git 检出，
-> 所以我**不能替你 commit/push**——发布这一步必须在你这侧执行，凭据也始终留在你手里。
+> 更新（实测）：把沙箱提到 `danger-full-access` 后，**我可以直接 push**（用的是本机 Git Credential
+> Manager 的缓存凭据，作者是你自己的 git 身份）。所以发布这一步现在由我做，你只需在审批弹窗点同意。
 
 ---
 
@@ -38,9 +39,11 @@
 **一次性**（走已批准通道输入，只需输一次）：
 
 ```bash
-alias dsv4sync='cd /home/s00988495/AFD/vllm-ascend && git fetch https://github.com/Pingzii/vllm-ascend.git debug/dsv4-mxfp-probe && git checkout -B debug/dsv4-mxfp-probe FETCH_HEAD'
-alias dsv4run='bash /home/s00988495/AFD/vllm-ascend/dsv4-mxfp-debug/run.sh'
-alias dsv4back='cd /home/s00988495/AFD/vllm-ascend && bash dsv4-mxfp-debug/run.sh --revert && git checkout -'
+# 关键：只把 debug 目录取出来，绝不要 checkout 整个分支！
+# （fork 的 main 可能落后上游很多，checkout 会把整个工作区降级到那个旧快照）
+alias dsv4sync='cd /home/s00988495/AFD/vllm-ascend && git fetch https://github.com/Pingzii/vllm-ascend.git debug/dsv4-mxfp-probe && git archive FETCH_HEAD dsv4-mxfp-debug | tar -x'
+alias dsv4run='cd /home/s00988495/AFD/vllm-ascend && bash dsv4-mxfp-debug/run.sh'
+alias dsv4back='cd /home/s00988495/AFD/vllm-ascend && bash dsv4-mxfp-debug/run.sh --revert && rm -rf dsv4-mxfp-debug vllm_ascend/ops/fused_moe/token_dispatcher.py.bak'
 ```
 
 （不想用 alias 就把这三行贴进 `~/.bashrc`，或写成 `~/dsv4run.sh`。）
@@ -48,9 +51,9 @@ alias dsv4back='cd /home/s00988495/AFD/vllm-ascend && bash dsv4-mxfp-debug/run.s
 **之后每次实验**：
 
 ```bash
-dsv4sync     # 拉最新调试包（只读流入）
+dsv4sync     # 只取 debug 目录（不动 HEAD、不动其它文件）
 dsv4run      # 跑 A~E，结论在 /tmp/dsv4_mxfp_sweep/report.txt
-dsv4back     # 回退，回到原分支
+dsv4back     # 还原 token_dispatcher.py + 清掉调试目录
 ```
 
 **外发只有一行**：`report.txt` 末尾的 `FINGERPRINT: A=... B=...`。
@@ -80,6 +83,35 @@ dsv4back     # 回退，回到原分支
 
 ---
 
+## 1.5 版本漂移警告（重要）
+
+与上游 `vllm-project/vllm-ascend@main` 的 `vllm_ascend/ops/fused_moe/token_dispatcher.py` 对比，
+**这个函数已经被重写过**：
+
+| | 你手上的版本 | 上游 main |
+|---|---|---|
+| `_dispatch_postprocess` 的 MXFP 分支 | 有 `if scale_type == torch.float8_e8m0fnu:`，做 `.view(torch.float8_e8m0fnu)` 并传 `active_num` | **该分支已删除**；`scale` 直接传入，签名里去掉了 `scale_type` |
+| `expert_num=` | `self.num_local_experts` | `self.num_experts` |
+| MC2 + A5 MXFP | 只有老的 `quant_mode` 2/0 路径 | 新增 `hardware_profile`/`HardwareCapability`、A5 MXFP `quant_mode=4`、`y_dtype` 等 |
+| `x_dtype=dst_type` | 传 | **仍然传**（所以若 `x_dtype` 真是元凶，上游也会中） |
+
+含义：
+
+1. 本目录的 A~E 补丁是按**你当前树的锚点**写的，只对你的版本有效（锚点不匹配会直接报错，不会改错）；
+2. 你遇到的这个问题**可能在上游已经不存在**（那条分支已被重写）——所以"修老代码"未必是正确投入；
+3. 若要向上游提 PR，必须基于上游最新代码重新分析，不能拿这里的补丁直接提。
+
+查落后多少（绿区只读，无对外写入）：
+
+```bash
+git remote add upstream https://github.com/vllm-project/vllm-ascend.git 2>/dev/null || true
+git fetch upstream
+git rev-list --left-right --count main...upstream/main   # 左=本地领先，右=落后
+git log --oneline -1 upstream/main
+```
+
+---
+
 ## 2. 怎么跑（一次一个变量）
 
 中转机（可上外网，一条命令，发布调试分支）：
@@ -106,15 +138,21 @@ I_AM_ON_TRANSFER_HOST=1 bash dsv4-mxfp-debug/push_debug_branch.sh
 > git commit -s -m "debug(dsv4): W4A8MXFP AllToAll routing variant switch + runbook" ; git push -u origin debug/dsv4-mxfp-probe
 > ```
 
-绿区（**只读**，三条命令，全自动；本步骤不含任何 git/网络写入）：
+绿区（**只读**；只取 debug 目录，**不切分支、不动其它文件**）：
 
 ```bash
-cd <vllm-ascend 检出目录>
-git fetch origin && git checkout debug/dsv4-mxfp-probe
-SERVE=/home/s00988495/AFD/mix/serve_8card.sh bash dsv4-mxfp-debug/run_matrix.sh
+cd /home/s00988495/AFD/vllm-ascend
+git fetch https://github.com/Pingzii/vllm-ascend.git debug/dsv4-mxfp-probe
+git archive FETCH_HEAD dsv4-mxfp-debug | tar -x     # ← 关键：不要 git checkout 整个分支
+bash dsv4-mxfp-debug/run.sh
 # 结论：/tmp/dsv4_mxfp_sweep/report.txt
-# 回退：bash dsv4-mxfp-debug/run_matrix.sh --revert
+# 回退：bash dsv4-mxfp-debug/run.sh --revert && rm -rf dsv4-mxfp-debug
 ```
+
+> **为什么必须是 `git archive` 而不是 `git checkout`**：本 fork 的 `main` 可能落后上游很多，
+> `git checkout <debug分支>` 会把**整个工作区**降级到 fork-main 那个旧快照，而不是只加几个调试文件。
+> `git archive FETCH_HEAD dsv4-mxfp-debug | tar -x` 只解出这一个目录，HEAD 与其它文件完全不动，
+> 所以 fork 落后多少都不影响你。
 
 `run_matrix.sh` 内部做完了这些（不用你手敲）：打补丁 → A~E 逐个起服务（出现启动成功或目标报错就提前退出）→ 日志落盘 → 生成 report.txt → 打印回退命令。
 
